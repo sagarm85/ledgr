@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import axios from 'axios'
 import {
@@ -6,7 +6,7 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, BarChart, Bar
 } from 'recharts'
 import PageHeader from '../components/PageHeader'
-import Button from '../components/Button'
+import RefreshBar from '../components/RefreshBar'
 
 interface AnalyticsData {
   total_invoices: number
@@ -33,8 +33,6 @@ const STATUS_LABEL: Record<string, string> = {
   ESCALATED:      'Escalated',
 }
 
-const PIE_COLORS = ['#31A24C', '#F57C00', '#D32F2F', '#7B1FA2']
-
 const RADIAN = Math.PI / 180
 const renderSliceLabel = ({ cx, cy, midAngle, innerRadius, outerRadius, percent }: {
   cx: number; cy: number; midAngle: number
@@ -56,6 +54,8 @@ export default function Reports() {
   const navigate = useNavigate()
   const [analytics, setAnalytics] = useState<AnalyticsData | null>(null)
   const [loading, setLoading] = useState(true)
+  const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null)
+  const hasData = useRef(false)
 
   const STATUS_COLORS: Record<string, string> = {
     FULLY_PAID:     'var(--color-success)',
@@ -64,21 +64,23 @@ export default function Reports() {
     ESCALATED:      'var(--color-escalated)',
   }
 
-  const fetchAnalytics = async () => {
-    setLoading(true)
+  const fetchAnalytics = useCallback(async () => {
+    if (!hasData.current) setLoading(true)   // spinner only on first load
     try {
       const res = await axios.get<AnalyticsData>('/api/analytics')
       setAnalytics(res.data)
+      setLastRefreshed(new Date())
+      hasData.current = true
     } catch (err) {
       console.error('Failed to fetch analytics', err)
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
 
   useEffect(() => {
     fetchAnalytics()
-  }, [])
+  }, [fetchAnalytics])
 
   const pieData = analytics
     ? Object.entries(analytics.status_breakdown).map(([name, value]) => ({ name, value }))
@@ -104,7 +106,7 @@ export default function Reports() {
 
   const statusRows = analytics
     ? Object.entries(analytics.status_breakdown).map(([status, count]) => ({
-        metric: `Count — ${status}`,
+        metric: STATUS_LABEL[status] ?? status,
         value: count.toLocaleString(),
         status,
         link: `/reconciliation?status=${status}`,
@@ -116,9 +118,7 @@ export default function Reports() {
       <PageHeader
         title="Reports & Analytics"
         action={
-          <Button size="sm" variant="secondary" onClick={fetchAnalytics}>
-            Refresh
-          </Button>
+          <RefreshBar onRefresh={fetchAnalytics} loading={loading} lastRefreshed={lastRefreshed} />
         }
       />
 
@@ -159,10 +159,11 @@ export default function Reports() {
                       labelLine={false}
                       label={renderSliceLabel}
                     >
-                      {pieData.map((_, i) => <Cell key={i} fill={PIE_COLORS[i % 4]} />)}
+                      {pieData.map((entry) => <Cell key={entry.name} fill={STATUS_HEX[entry.name] ?? '#999'} />)}
                     </Pie>
                     <Tooltip formatter={(v: number) => v.toLocaleString()} />
-                    <Legend />
+
+                    <Legend formatter={(name: string) => STATUS_LABEL[name] ?? name} />
                   </PieChart>
                 </ResponsiveContainer>
               ) : (
@@ -270,24 +271,32 @@ export default function Reports() {
                       cursor: 'pointer',
                       transition: 'background 0.1s',
                     }}
-                    onMouseEnter={e => { e.currentTarget.style.background = 'var(--color-bg)' }}
-                    onMouseLeave={e => { e.currentTarget.style.background = 'transparent' }}
+                    onMouseEnter={e => {
+                      e.currentTarget.style.background = 'var(--color-bg)'
+                      const label = e.currentTarget.querySelector<HTMLElement>('.row-label')
+                      if (label) label.style.textDecoration = 'underline'
+                    }}
+                    onMouseLeave={e => {
+                      e.currentTarget.style.background = 'transparent'
+                      const label = e.currentTarget.querySelector<HTMLElement>('.row-label')
+                      if (label) label.style.textDecoration = 'none'
+                    }}
                   >
-                    <td style={{ padding: '12px 24px', fontSize: 13, color: 'var(--color-text-2)' }}>
+                    <td style={{ padding: '12px 24px', fontSize: 13 }}>
                       <span style={{
                         display: 'inline-block', width: 8, height: 8, borderRadius: '50%',
                         background: STATUS_COLORS[status] ?? 'var(--color-text-3)',
                         marginRight: 8,
                       }} />
-                      {metric}
-                    </td>
-                    <td style={{ padding: '12px 24px', fontSize: 14, fontWeight: 700, color: STATUS_COLORS[status] ?? 'var(--color-text)' }}>
-                      <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8 }}>
-                        {value}
-                        <span style={{ fontSize: 12, color: 'var(--color-primary)', fontWeight: 400 }}>
-                          View in Reconciliation →
-                        </span>
+                      <span
+                        className="row-label"
+                        style={{ color: STATUS_COLORS[status] ?? 'var(--color-text)', fontWeight: 500 }}
+                      >
+                        {metric}
                       </span>
+                    </td>
+                    <td style={{ padding: '12px 24px', fontSize: 14, fontWeight: 700, color: STATUS_COLORS[status] ?? 'var(--color-text)', textAlign: 'right' }}>
+                      {value}
                     </td>
                   </tr>
                 ))}

@@ -264,6 +264,7 @@ export default function Reconciliation() {
   const [selected, setSelected] = useState<ReconciliationRecord | null>(null)
   const [loading, setLoading] = useState(false)
   const [page, setPage] = useState(1)
+  const [statusCounts, setStatusCounts] = useState<Record<string, number>>({})
 
   const [candidates, setCandidates] = useState<PaymentRecord[]>([])
   const [candidatesLoading, setCandidatesLoading] = useState(false)
@@ -285,7 +286,15 @@ export default function Reconciliation() {
     }
   }, [])
 
+  const loadStatusCounts = useCallback(async () => {
+    try {
+      const res = await axios.get<{ status_breakdown: Record<string, number> }>('/api/analytics')
+      setStatusCounts(res.data.status_breakdown)
+    } catch { /* non-critical */ }
+  }, [])
+
   useEffect(() => { loadRecords(statusFilter, page) }, [statusFilter, page, loadRecords])
+  useEffect(() => { loadStatusCounts() }, [loadStatusCounts])
 
   const loadCandidates = useCallback(async (invoiceId: string) => {
     setCandidatesLoading(true)
@@ -352,22 +361,45 @@ export default function Reconciliation() {
     <>
       <PageHeader
         title="Reconciliation"
-        action={<span style={{ fontSize: 13, color: 'var(--color-text-2)' }}>{total.toLocaleString()} records</span>}
+        action={
+          <span style={{ fontSize: 13, color: 'var(--color-text-2)' }}>
+            {Object.keys(statusCounts).length > 0
+              ? Object.values(statusCounts).reduce((a, b) => a + b, 0).toLocaleString()
+              : total.toLocaleString()
+            } total records
+          </span>
+        }
       />
 
       {/* Status filter pills */}
       <div style={{ display: 'flex', gap: 6, marginBottom: 'var(--space-md)', flexWrap: 'wrap' }}>
-        {STATUS_FILTERS.map(s => (
-          <button key={s} onClick={() => handleFilter(s)} style={{
-            padding: '5px 14px', borderRadius: 'var(--radius-xl)', border: '1px solid',
-            borderColor: statusFilter === s ? 'var(--color-primary)' : 'var(--color-border)',
-            background: statusFilter === s ? 'var(--color-primary-light)' : 'transparent',
-            color: statusFilter === s ? 'var(--color-primary)' : 'var(--color-text-2)',
-            fontWeight: statusFilter === s ? 700 : 400, fontSize: 12, cursor: 'pointer',
-          }}>
-            {s === 'ALL' ? 'All' : s.replace('_', ' ')}
-          </button>
-        ))}
+        {STATUS_FILTERS.map(s => {
+          const count = s === 'ALL'
+            ? Object.values(statusCounts).reduce((a, b) => a + b, 0)
+            : (statusCounts[s] ?? null)
+          const active = statusFilter === s
+          return (
+            <button key={s} onClick={() => handleFilter(s)} style={{
+              padding: '5px 14px', borderRadius: 'var(--radius-xl)', border: '1px solid',
+              borderColor: active ? 'var(--color-primary)' : 'var(--color-border)',
+              background: active ? 'var(--color-primary-light)' : 'transparent',
+              color: active ? 'var(--color-primary)' : 'var(--color-text-2)',
+              fontWeight: active ? 700 : 400, fontSize: 12, cursor: 'pointer',
+              display: 'flex', alignItems: 'center', gap: 5,
+            }}>
+              {s === 'ALL' ? 'All' : s.replace(/_/g, ' ')}
+              {count != null && count > 0 && (
+                <span style={{
+                  background: active ? 'var(--color-primary)' : 'var(--color-border)',
+                  color: active ? '#fff' : 'var(--color-text-2)',
+                  borderRadius: 10, padding: '1px 6px', fontSize: 10, fontWeight: 700,
+                }}>
+                  {count >= 1000 ? `${(count / 1000).toFixed(1)}K` : count}
+                </span>
+              )}
+            </button>
+          )
+        })}
       </div>
 
       {/* Split pane */}

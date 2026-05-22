@@ -13,9 +13,10 @@ interface DataFlowCardProps {
   rate: number
   eta: number
   status?: 'healthy' | 'warning' | 'critical'
+  countLabel?: string
 }
 
-export default function DataFlowCard({ stage, queued, rate, eta, status = 'healthy' }: DataFlowCardProps) {
+export default function DataFlowCard({ stage, queued, rate, eta, status = 'healthy', countLabel = 'Queued' }: DataFlowCardProps) {
   const color = STATUS_COLOR[status] || 'var(--color-text-2)'
   const progress = Math.max(5, Math.min(100, 100 - (queued / 50000 * 100)))
 
@@ -34,7 +35,7 @@ export default function DataFlowCard({ stage, queued, rate, eta, status = 'healt
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 'var(--space-sm)', marginBottom: 'var(--space-sm)' }}>
         {[
-          ['Queued', queued?.toLocaleString() ?? '—'],
+          [countLabel, queued?.toLocaleString() ?? '—'],
           ['Rate',   rate ? `${rate}/s` : '—'],
           ['ETA',    eta  ? `${eta}min` : '—'],
         ].map(([k, v]) => (

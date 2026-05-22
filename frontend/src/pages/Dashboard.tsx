@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import axios from 'axios'
 import {
   PieChart, Pie, Cell, AreaChart, Area,
@@ -6,7 +6,7 @@ import {
 } from 'recharts'
 import StatsCard from '../components/StatsCard'
 import PageHeader from '../components/PageHeader'
-import Button from '../components/Button'
+import RefreshBar from '../components/RefreshBar'
 
 interface AnalyticsData {
   total_invoices: number
@@ -58,24 +58,30 @@ export default function Dashboard() {
   const [analytics, setAnalytics] = useState<AnalyticsData | null>(null)
   const [health, setHealth] = useState<ServiceHealth | null>(null)
   const [loading, setLoading] = useState(true)
+  const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null)
+  const hasData = useRef(false)
+
+  const fetchAll = useCallback(async () => {
+    if (!hasData.current) setLoading(true)
+    try {
+      const [analyticsRes, healthRes] = await Promise.all([
+        axios.get<AnalyticsData>('/api/analytics'),
+        axios.get<ServiceHealth>('/api/health'),
+      ])
+      setAnalytics(analyticsRes.data)
+      setHealth(healthRes.data)
+      setLastRefreshed(new Date())
+      hasData.current = true
+    } catch (err) {
+      console.error('Failed to fetch dashboard data', err)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
 
   useEffect(() => {
-    const fetchAll = async () => {
-      try {
-        const [analyticsRes, healthRes] = await Promise.all([
-          axios.get<AnalyticsData>('/api/analytics'),
-          axios.get<ServiceHealth>('/api/health'),
-        ])
-        setAnalytics(analyticsRes.data)
-        setHealth(healthRes.data)
-      } catch (err) {
-        console.error('Failed to fetch dashboard data', err)
-      } finally {
-        setLoading(false)
-      }
-    }
     fetchAll()
-  }, [])
+  }, [fetchAll])
 
   const formatCurrency = (val: number) => {
     if (val >= 1_000_000) return `$${(val / 1_000_000).toFixed(1)}M`
@@ -96,9 +102,7 @@ export default function Dashboard() {
       <PageHeader
         title="Dashboard"
         action={
-          <Button size="sm" onClick={() => window.location.reload()}>
-            Refresh
-          </Button>
+          <RefreshBar onRefresh={fetchAll} loading={loading} lastRefreshed={lastRefreshed} />
         }
       />
 

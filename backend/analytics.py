@@ -76,7 +76,6 @@ def get_analytics(tenant_id: str) -> AnalyticsResponse:
         {"t": tenant_id}
     )
     total_invoices = int(totals[0][0]) if totals else 0
-    total_amount   = float(totals[0][1]) if totals else 0.0
     total_due      = float(totals[0][2]) if totals else 0.0
 
     status_rows = q(
@@ -152,46 +151,62 @@ def get_llm_queue(tenant_id: str) -> LLMQueueResponse:
             log.error("ClickHouse llm_queue error: %s", e)
             return []
 
+    # --- Live LLM events (when Ollama is active) ---
     summary = q(
         "SELECT status, outcome, count(), avg(duration_ms) "
-        "FROM llm_events WHERE tenant_id = %(t)s GROUP BY status, outcome",
+        "FROM reconciliation.llm_events WHERE tenant_id = %(t)s GROUP BY status, outcome",
         {"t": tenant_id}
     )
-    queued = completed = escalated = active = 0
+    queued = completed = active = 0
     total_duration = count_with_duration = 0
     for row in summary:
         status, outcome, cnt, avg_dur = row
         cnt = int(cnt)
-        if status == "queued":
-            queued += cnt
-        elif status == "processing":
-            active += cnt
-        elif status == "done":
+        if status == "queued":       queued    += cnt
+        elif status == "processing": active    += cnt
+        elif status in ("done", "failed"):
             completed += cnt
-            if outcome == "ESCALATED":
-                escalated += cnt
             if avg_dur:
-                total_duration += avg_dur * cnt
+                total_duration     += avg_dur * cnt
                 count_with_duration += cnt
-        elif status == "failed":
-            completed += cnt
 
     avg_duration = round(total_duration / count_with_duration, 1) if count_with_duration else None
 
+    # --- Escalated: always read from invoices_reconciled (covers SKIP_LLM=true runs) ---
+    esc_row = q(
+        "SELECT count() FROM reconciliation.invoices_reconciled "
+        "WHERE tenant_id = %(t)s AND status = 'ESCALATED'",
+        {"t": tenant_id}
+    )
+    escalated = int(esc_row[0][0]) if esc_row else 0
+
+    # --- Active queue rows from llm_events ---
     active_rows = q(
         "SELECT invoice_id, tenant_id, toString(started_at), toString(completed_at), "
         "duration_ms, candidates, outcome, confidence, reasoning, status "
-        "FROM llm_events WHERE tenant_id = %(t)s AND status IN ('queued','processing') "
+        "FROM reconciliation.llm_events WHERE tenant_id = %(t)s AND status IN ('queued','processing') "
         "ORDER BY started_at DESC LIMIT 50",
         {"t": tenant_id}
     )
+
+    # --- Recent completed: prefer llm_events, fall back to ESCALATED invoices ---
     recent_rows = q(
+        "SELECT invoice_id, tenant_id, toString(reconciled_at), toString(reconciled_at), "
+        "0 as duration_ms, 0 as candidates, status as outcome, confidence, reasoning, 'done' as event_status "
+        "FROM reconciliation.invoices_reconciled "
+        "WHERE tenant_id = %(t)s AND status = 'ESCALATED' "
+        "ORDER BY reconciled_at DESC LIMIT 100",
+        {"t": tenant_id}
+    ) if not completed else q(
         "SELECT invoice_id, tenant_id, toString(started_at), toString(completed_at), "
         "duration_ms, candidates, outcome, confidence, reasoning, status "
-        "FROM llm_events WHERE tenant_id = %(t)s AND status IN ('done','failed') "
+        "FROM reconciliation.llm_events WHERE tenant_id = %(t)s AND status IN ('done','failed') "
         "ORDER BY completed_at DESC LIMIT 100",
         {"t": tenant_id}
     )
+
+    # completed count = llm_events done OR total escalated (whichever is larger)
+    completed = max(completed, escalated)
 
     def to_event(row) -> LLMEvent:
         return LLMEvent(

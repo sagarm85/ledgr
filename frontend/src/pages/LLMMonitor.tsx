@@ -1,11 +1,9 @@
 import { useState, useEffect, useCallback } from 'react'
 import axios from 'axios'
 import PageHeader from '../components/PageHeader'
-import Button from '../components/Button'
+import RefreshBar from '../components/RefreshBar'
 import ConfidenceBar from '../components/ConfidenceBar'
 import StatusBadge from '../components/StatusBadge'
-
-const REFRESH_INTERVAL = 15_000
 
 interface LLMEvent {
   invoice_id: string
@@ -59,7 +57,6 @@ function formatMs(ms: number | null): string {
 export default function LLMMonitor() {
   const [data, setData] = useState<LLMQueue | null>(null)
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null)
-  const [countdown, setCountdown] = useState(REFRESH_INTERVAL / 1000)
   const [loading, setLoading] = useState(false)
 
   const fetch = useCallback(async () => {
@@ -68,24 +65,12 @@ export default function LLMMonitor() {
       const res = await axios.get<LLMQueue>('/api/monitoring/llm-queue')
       setData(res.data)
       setLastRefresh(new Date())
-      setCountdown(REFRESH_INTERVAL / 1000)
     } catch {
       // keep stale data on error
     } finally {
       setLoading(false)
     }
   }, [])
-
-  useEffect(() => {
-    fetch()
-    const interval = setInterval(fetch, REFRESH_INTERVAL)
-    return () => clearInterval(interval)
-  }, [fetch])
-
-  useEffect(() => {
-    const tick = setInterval(() => setCountdown(c => Math.max(0, c - 1)), 1000)
-    return () => clearInterval(tick)
-  }, [lastRefresh])
 
   const card = (label: string, value: number, color: string, sub?: string) => (
     <div style={{
@@ -118,16 +103,7 @@ export default function LLMMonitor() {
       <PageHeader
         title="LLM Processing Queue"
         action={
-          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)' }}>
-            <span style={{ fontSize: 12, color: 'var(--color-text-3)' }}>
-              {lastRefresh
-                ? `Last refresh: ${lastRefresh.toLocaleTimeString()} · refresh in ${countdown}s`
-                : 'Loading…'}
-            </span>
-            <Button size="sm" variant="secondary" onClick={fetch}>
-              {loading ? '…' : 'Refresh Now'}
-            </Button>
-          </div>
+          <RefreshBar onRefresh={fetch} loading={loading} lastRefreshed={lastRefresh} />
         }
       />
 

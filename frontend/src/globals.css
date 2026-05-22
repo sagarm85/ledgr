@@ -55,6 +55,16 @@ body { font-family: var(--font); background: var(--color-bg); color: var(--color
   50% { opacity: 0.5; }
 }
 
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.spin {
+  display: inline-block;
+  animation: spin 0.7s linear infinite;
+}
+
 @media (max-width: 1024px) {
   .stats-grid  { grid-template-columns: repeat(2, 1fr) !important; }
   .stage-grid  { grid-template-columns: repeat(2, 1fr) !important; }

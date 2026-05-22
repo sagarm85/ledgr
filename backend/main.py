@@ -99,17 +99,102 @@ async def search(req: SearchRequest, tenant_id: str = Depends(get_tenant)):
 async def analytics(tenant_id: str = Depends(get_tenant)):
     return get_analytics(tenant_id)
 
+def _kafka_backlog_sync() -> list:
+    from kafka import KafkaAdminClient, KafkaConsumer, TopicPartition
+    from elasticsearch import Elasticsearch
+    import clickhouse_driver
+
+    def _kafka_counts():
+        try:
+            admin    = KafkaAdminClient(bootstrap_servers=KAFKA_BROKER, client_id="ledgr-monitor")
+            consumer = KafkaConsumer(bootstrap_servers=KAFKA_BROKER, group_id=None)
+
+            def topic_end_offsets(topic: str) -> int:
+                parts = admin.describe_topics([topic])[0]["partitions"]
+                tps   = [TopicPartition(topic, p["partition"]) for p in parts]
+                return sum(consumer.end_offsets(tps).values())
+
+            def group_lag(group: str, topics: list) -> int:
+                try:
+                    offsets = admin.list_consumer_group_offsets(group)
+                    lag = 0
+                    for tp, meta in offsets.items():
+                        if tp.topic in topics:
+                            ends = consumer.end_offsets([tp])
+                            lag += max(0, ends.get(tp, 0) - meta.offset)
+                    return lag
+                except Exception:
+                    return 0
+
+            ingest = topic_end_offsets("invoices-raw") + topic_end_offsets("payments-raw")
+            lag    = group_lag("reconciliation-job-v2", ["invoices-raw", "payments-raw"])
+            consumer.close()
+            admin.close()
+            return ingest, lag
+        except Exception as e:
+            log.warning("Kafka monitor error: %s", e)
+            return 0, 0
+
+    def _es_count() -> int:
+        try:
+            es = Elasticsearch(ES_HOST)
+            r  = es.cat.indices(index="invoices-*", h="docs.count", format="json")
+            return sum(int(x.get("docs.count", 0) or 0) for x in r)
+        except Exception:
+            return 0
+
+    def _es_unreconciled() -> int:
+        try:
+            es = Elasticsearch(ES_HOST)
+            r  = es.count(index="invoices-*", body={
+                "query": {"terms": {"status": ["UNPAID", "ESCALATED"]}}
+            })
+            return r["count"]
+        except Exception:
+            return 0
+
+    def _ch_count() -> int:
+        try:
+            ch = clickhouse_driver.Client(host=CH_HOST, port=int(CH_PORT.split(":")[0]) if ":" not in CH_PORT else 9000)
+            r  = ch.execute("SELECT count() FROM reconciliation.invoices_reconciled")
+            return r[0][0]
+        except Exception:
+            return 0
+
+    def _llm_count() -> int:
+        try:
+            ch = clickhouse_driver.Client(host=CH_HOST, port=9000)
+            r  = ch.execute("SELECT count() FROM reconciliation.invoices_reconciled WHERE confidence < 0.7 AND confidence > 0")
+            return r[0][0]
+        except Exception:
+            return 0
+
+    ingest, recon_lag = _kafka_counts()
+    es_count     = _es_count()
+    ch_count     = _ch_count()
+    llm_count    = _llm_count()
+    unreconciled = _es_unreconciled()
+    reconciled   = max(0, es_count - unreconciled)
+
+    def lag_status(lag: int) -> str:
+        if lag > 500_000: return "critical"
+        if lag > 100_000: return "warning"
+        return "healthy"
+
+    return [
+        {"stage": "Kafka Ingest",         "queued": ingest,       "rate": 0, "eta": 0, "status": "healthy"},
+        {"stage": "Kafka Consumer Lag",   "queued": recon_lag,    "rate": 0, "eta": 0, "status": lag_status(recon_lag)},
+        {"stage": "Reconciled",           "queued": reconciled,   "rate": 0, "eta": 0, "status": "healthy"},
+        {"stage": "Unreconciled",         "queued": unreconciled, "rate": 0, "eta": 0, "status": "warning" if unreconciled > 0 else "healthy"},
+        {"stage": "Elasticsearch Sink",   "queued": es_count,     "rate": 0, "eta": 0, "status": "healthy"},
+        {"stage": "ClickHouse Sink",      "queued": ch_count,     "rate": 0, "eta": 0, "status": "healthy"},
+        {"stage": "Ollama LLM",           "queued": llm_count,    "rate": 0, "eta": 0, "status": "healthy"},
+    ]
+
 @app.get("/api/monitoring/backlog")
 async def backlog():
-    stages = [
-        {"stage": "Kafka Ingest", "queued": 0, "rate": 0, "eta": 0, "status": "healthy"},
-        {"stage": "Reconciliation", "queued": 0, "rate": 0, "eta": 0, "status": "healthy"},
-        {"stage": "Elasticsearch Sink", "queued": 0, "rate": 0, "eta": 0, "status": "healthy"},
-        {"stage": "ClickHouse Sink", "queued": 0, "rate": 0, "eta": 0, "status": "healthy"},
-        {"stage": "Ollama LLM", "queued": 0, "rate": 0, "eta": 0, "status": "healthy"},
-        {"stage": "PostgreSQL Audit", "queued": 0, "rate": 0, "eta": 0, "status": "healthy"},
-    ]
-    return stages
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_kafka_executor, _kafka_backlog_sync)
 
 @app.get("/api/monitoring/llm-queue", response_model=LLMQueueResponse)
 async def llm_queue(tenant_id: str = Depends(get_tenant)):
