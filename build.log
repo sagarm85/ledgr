@@ -1,0 +1,38 @@
+All checks pass. Here's what was built:
+
+---
+
+**Ledgr is fully scaffolded.** All files are in place, Python syntax is clean, and TypeScript compiles with zero errors.
+
+### What was created
+
+| Layer | Files |
+|-------|-------|
+| **Root** | `.env.example`, `docker-compose.yml`, `PROGRESS.md` |
+| **job/** | `generate.py` — Kafka producer with Faker, snappy compression |
+| **llm/** | `client.py` — Ollama wrapper, `MatchResult` + `QueryFilters` with constrained decoding |
+| **streams/** | `reconciliation_job.py` — dual-topic consumer, exact-ref fast path + Ollama fallback |
+| **backend/** | `main.py`, `models.py`, `search.py`, `analytics.py`, `requirements.txt`, `Dockerfile` |
+| **frontend/** | Vite + React + TypeScript — 9 components, 4 pages, proxy config, nginx, Dockerfile |
+
+### To run it
+
+```bash
+# Pull Ollama model once
+docker exec ledgr-ollama-1 ollama pull mistral
+
+# Start all services
+docker compose up -d
+
+# Check health
+curl http://localhost:8000/api/health
+
+# Open UI
+open http://localhost:3000
+
+# Generate test data
+python job/generate.py --tenant-id DEMO --invoices 10000 --payments 8000
+```
+
+### One decision to note
+Vite requires the `VITE_` prefix for env vars — `REACT_APP_OLLAMA_MODEL` in `.env.example` should be `VITE_OLLAMA_MODEL` if you want the model name to appear in the sidebar. The sidebar component references `import.meta.env.VITE_OLLAMA_MODEL`.

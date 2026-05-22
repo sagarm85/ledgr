@@ -1,0 +1,12 @@
+fastapi==0.110.0
+uvicorn[standard]==0.27.0
+pydantic==2.6.0
+elasticsearch==8.12.0
+clickhouse-driver==0.2.7
+psycopg2-binary==2.9.9
+kafka-python==2.0.2
+ollama==0.1.8
+python-jose[cryptography]==3.3.0
+python-multipart==0.0.9
+faker==24.2.0
+httpx==0.27.2
