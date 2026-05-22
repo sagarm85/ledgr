@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import axios from 'axios'
 import {
-  PieChart, Pie, Cell, AreaChart, Area,
+  PieChart, Pie, Cell, LineChart, Line,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
 } from 'recharts'
 import StatsCard from '../components/StatsCard'
@@ -15,6 +15,7 @@ interface AnalyticsData {
   escalated_rate: number
   status_breakdown: Record<string, number>
   daily_volumes: Array<{ date: string; count: number; total: number }>
+  daily_payment_volumes: Array<{ date: string; count: number; total: number }>
   tenant_id: string
 }
 
@@ -95,7 +96,16 @@ export default function Dashboard() {
     ? Object.entries(analytics.status_breakdown).map(([name, value]) => ({ name, value }))
     : []
 
-  const chartData = analytics?.daily_volumes.slice().reverse() ?? []
+  const chartData = (() => {
+    const invByDate = new Map((analytics?.daily_volumes ?? []).map(d => [d.date, d.count]))
+    const payByDate = new Map((analytics?.daily_payment_volumes ?? []).map(d => [d.date, d.count]))
+    const allDates  = [...new Set([...invByDate.keys(), ...payByDate.keys()])].sort()
+    return allDates.map(date => ({
+      date,
+      invoices: invByDate.get(date) ?? 0,
+      payments: payByDate.get(date) ?? 0,
+    }))
+  })()
 
   return (
     <>
@@ -190,7 +200,7 @@ export default function Dashboard() {
           )}
         </div>
 
-        {/* Daily Volume Area Chart */}
+        {/* Daily Invoices & Payments Line Chart */}
         <div style={{
           background: 'var(--color-surface)',
           borderRadius: 'var(--radius-lg)',
@@ -198,17 +208,19 @@ export default function Dashboard() {
           boxShadow: 'var(--shadow-sm)',
         }}>
           <p style={{ fontWeight: 600, marginBottom: 'var(--space-md)', fontSize: 15 }}>
-            Daily Invoice Volume (last 30 days)
+            Daily Invoices &amp; Payments (last 30 days)
           </p>
           {chartData.length > 0 ? (
             <ResponsiveContainer width="100%" height={220}>
-              <AreaChart data={chartData}>
+              <LineChart data={chartData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" />
                 <XAxis dataKey="date" tick={{ fontSize: 10 }} />
                 <YAxis tick={{ fontSize: 10 }} />
-                <Tooltip />
-                <Area type="monotone" dataKey="count" stroke="#1877F2" fill="#E7F3FF" name="Invoices" />
-              </AreaChart>
+                <Tooltip formatter={(v: number) => v.toLocaleString()} />
+                <Legend wrapperStyle={{ fontSize: 12, paddingTop: 8 }} />
+                <Line type="monotone" dataKey="invoices" stroke="#1877F2" strokeWidth={2} dot={false} name="Invoices" />
+                <Line type="monotone" dataKey="payments" stroke="#31A24C" strokeWidth={2} dot={false} name="Payments" />
+              </LineChart>
             </ResponsiveContainer>
           ) : (
             <div style={{ height: 220, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-text-3)' }}>

@@ -2,7 +2,7 @@
 # python job/generate.py --tenant-id ACME --invoices 1000000 --payments 800000
 
 import argparse, json, random, time, os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from faker import Faker
 from kafka import KafkaProducer
 
@@ -25,7 +25,7 @@ def run(tenant_id: str, n_invoices: int, n_payments: int, batch_size: int):
 
     print(f"Generating {n_invoices:,} invoices → tenant: {tenant_id}")
     for i in range(n_invoices):
-        d = fake.date_between(start_date="-6m")
+        d = fake.date_between(start_date=date(2025, 1, 1), end_date=date.today())
         inv = {
             "invoice_id":   f"{tenant_id}-INV-{i+1:010d}",
             "tenant_id":    tenant_id,

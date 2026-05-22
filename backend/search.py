@@ -155,7 +155,11 @@ def search_invoices(query: str, tenant_id: str, page: int = 1, size: int = 50) -
     if filters.invoice_id_hint:
         must_clauses.append({"term": {"invoice_id": filters.invoice_id_hint}})
     else:
-        if clean_status:
+        if filters.overdue:
+            # past due date AND still has an outstanding balance
+            must_clauses.append({"range": {"due_date": {"lt": "now/d"}}})
+            must_clauses.append({"range": {"due_amount": {"gt": 0}}})
+        elif clean_status:
             must_clauses.append({"terms": {"status": clean_status}})
 
         if filters.min_amount > 0 or filters.max_amount > 0:
@@ -172,10 +176,10 @@ def search_invoices(query: str, tenant_id: str, page: int = 1, size: int = 50) -
             must_clauses.append({"range": {"invoice_date": {"lte": filters.date_to}}})
 
         if filters.customer_keywords:
-            must_clauses.append({"match": {"customer": " ".join(filters.customer_keywords)}})
+            must_clauses.append({"match_phrase": {"customer": " ".join(filters.customer_keywords)}})
 
         if filters.merchant_keywords:
-            must_clauses.append({"match": {"merchant": " ".join(filters.merchant_keywords)}})
+            must_clauses.append({"match_phrase": {"merchant": " ".join(filters.merchant_keywords)}})
 
         # Full-text fallback across merchant + customer for the meaning text
         if filters.meaning and not any([clean_status, filters.customer_keywords, filters.merchant_keywords]):

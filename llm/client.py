@@ -21,10 +21,11 @@ class QueryFilters(BaseModel):
     invoice_id_hint: str = ""    # exact invoice_id if user typed one, else ""
     min_amount: float = 0.0      # 0.0 = no lower bound
     max_amount: float = 0.0      # 0.0 = no upper bound
-    date_from: str = ""          # "" = no start date
-    date_to: str = ""            # "" = no end date
+    date_from: str = ""          # "" = no start date (applies to invoice_date)
+    date_to: str = ""            # "" = no end date   (applies to invoice_date)
     customer_keywords: list[str] = []
     merchant_keywords: list[str] = []
+    overdue: bool = False        # true = due_date before today AND due_amount > 0
     meaning: str = ""
 
     def clean_status(self) -> list[str]:
@@ -108,17 +109,18 @@ Rules:
 - status: list from [FULLY_PAID, PARTIALLY_PAID, UNPAID, ESCALATED] only. Empty list = all. NEVER put invoice IDs or other values here.
 - min_amount: minimum invoice amount in dollars, or 0.0 if no lower bound.
 - max_amount: maximum invoice amount in dollars, or 0.0 if no upper bound.
-- date_from: start date as YYYY-MM-DD, or empty string.
-- date_to: end date as YYYY-MM-DD, or empty string.
+- date_from: invoice creation start date as YYYY-MM-DD, or empty string.
+- date_to: invoice creation end date as YYYY-MM-DD, or empty string.
 - customer_keywords: customer name words to match, or empty list.
 - merchant_keywords: merchant/vendor name words to match, or empty list.
+- overdue: set true ONLY when the user asks for overdue, outstanding, past-due, or unpaid-past-due invoices (i.e. due date has passed and balance is still owed). Do NOT set status when overdue is true.
 - meaning: one-sentence summary of what the user is looking for.
 """
     filters = QueryFilters.model_validate_json(_chat(prompt, QueryFilters))
     log.info(
-        "Ollama parsed query | input=%r invoice_id=%r status=%s min=%.2f max=%.2f "
+        "Ollama parsed query | input=%r invoice_id=%r status=%s overdue=%s min=%.2f max=%.2f "
         "date=[%s,%s] customer=%s merchant=%s meaning=%r",
-        user_query, filters.invoice_id_hint, filters.clean_status(),
+        user_query, filters.invoice_id_hint, filters.clean_status(), filters.overdue,
         filters.min_amount, filters.max_amount,
         filters.date_from or "*", filters.date_to or "*",
         filters.customer_keywords, filters.merchant_keywords, filters.meaning,

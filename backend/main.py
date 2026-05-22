@@ -15,7 +15,7 @@ _kafka_executor = ThreadPoolExecutor(max_workers=1)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger(__name__)
 
-_rematch_job: dict = {"running": False, "total": 0, "done": 0, "tenant_id": None, "started_at": None}
+_rematch_job: dict = {"running": False, "total": 0, "done": 0, "tenant_id": None, "started_at": None, "stop_requested": False}
 
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-in-production")
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
@@ -322,8 +322,6 @@ async def manual_reconcile(req: ManualReconcileRequest, tenant_id: str = Depends
     return ManualReconcileResponse(invoice_id=req.invoice_id, payment_id=req.payment_id, status=req.status, updated=True)
 
 def _rematch_one(inv: dict, tenant_id: str, index: str, confidence_threshold: float):
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     from llm.client import match_invoice
     from search import get_es
     from analytics import get_client as ch_client
@@ -335,9 +333,7 @@ def _rematch_one(inv: dict, tenant_id: str, index: str, confidence_threshold: fl
             return
 
         # Stage 1: fuzzy rule-based match — avoids Ollama for clear cases
-        import sys
-        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from streams.reconciliation_job import fuzzy_match
+        from fuzzy import fuzzy_match
         fuzzy = fuzzy_match(inv, candidates)
         if fuzzy:
             update_doc = {
@@ -426,8 +422,7 @@ def _rematch_one(inv: dict, tenant_id: str, index: str, confidence_threshold: fl
 
 
 async def _rematch_all_async(tenant_id: str):
-    import sys, time as _time
-    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    import time as _time
     from search import get_es
 
     CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.75"))
@@ -462,11 +457,14 @@ async def _rematch_all_async(tenant_id: str):
         search_after = hits[-1]["sort"]
 
     _rematch_job.update({"running": True, "total": len(all_invoices), "done": 0,
-                         "tenant_id": tenant_id, "started_at": _time.time()})
+                         "tenant_id": tenant_id, "started_at": _time.time(), "stop_requested": False})
     log.info("Batch rematch started: %d ESCALATED invoices", len(all_invoices))
 
     try:
         for inv in all_invoices:
+            if _rematch_job.get("stop_requested"):
+                log.info("Batch rematch stopped by user at %d/%d", _rematch_job["done"], len(all_invoices))
+                break
             await asyncio.to_thread(_rematch_one, inv, tenant_id, index, CONFIDENCE_THRESHOLD)
             _rematch_job["done"] += 1
             if _rematch_job["done"] % 10 == 0:
@@ -474,6 +472,7 @@ async def _rematch_all_async(tenant_id: str):
             await asyncio.sleep(DELAY_S)
     finally:
         _rematch_job["running"] = False
+        _rematch_job["stop_requested"] = False
         log.info("Batch rematch complete: %d/%d processed", _rematch_job["done"], len(all_invoices))
 
 
@@ -493,6 +492,14 @@ async def rematch_status():
         "rate_per_s": rate,
         "eta_s":      eta_s,
     }
+
+@app.post("/api/reconciliation/rematch-stop")
+async def rematch_stop():
+    if not _rematch_job["running"]:
+        return {"status": "not_running"}
+    _rematch_job["stop_requested"] = True
+    log.info("Batch rematch stop requested")
+    return {"status": "stop_requested", "done": _rematch_job["done"], "total": _rematch_job["total"]}
 
 @app.post("/api/reconciliation/rematch-skipped")
 async def rematch_skipped(tenant_id: str = Depends(get_tenant)):

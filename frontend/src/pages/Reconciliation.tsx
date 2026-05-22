@@ -276,15 +276,26 @@ export default function Reconciliation() {
   const [jobStatus, setJobStatus] = useState<{ running: boolean; total: number; done: number; eta_s: number | null } | null>(null)
   const [statusLoading, setStatusLoading] = useState(true)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const autoSelectRef = useRef(searchParams.get('status') !== null)
 
   const loadRecords = useCallback(async (status: string, p: number) => {
     setLoading(true)
+    const shouldAutoSelect = autoSelectRef.current
+    autoSelectRef.current = false
     try {
       const params: Record<string, string | number> = { page: p, size: PAGE_SIZE }
       if (status !== 'ALL') params.status = status
       const res = await axios.get<{ total: number; records: ReconciliationRecord[] }>('/api/reconciliation', { params })
       setRecords(res.data.records)
       setTotal(res.data.total)
+      if (shouldAutoSelect && res.data.records.length > 0) {
+        const first = res.data.records[0]
+        setSelected(first)
+        setCandidates([])
+        axios.get<PaymentRecord[]>(`/api/payments/${first.invoice_id}`)
+          .then(r => setCandidates(r.data))
+          .catch(() => {})
+      }
     } finally {
       setLoading(false)
     }
@@ -317,6 +328,7 @@ export default function Reconciliation() {
   }
 
   const handleFilter = (s: string) => {
+    autoSelectRef.current = true
     setStatusFilter(s)
     setPage(1)
     setSelected(null)
@@ -400,6 +412,15 @@ export default function Reconciliation() {
       .finally(() => setStatusLoading(false))
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [])
+
+  const handleStopRematch = async () => {
+    try {
+      await axios.post('/api/reconciliation/rematch-stop')
+      showToast('Stop requested — current invoice will finish, then the job will halt.')
+    } catch {
+      showToast('Failed to stop job — check backend logs.')
+    }
+  }
 
   const handleRematchAll = async () => {
     try {
@@ -506,10 +527,23 @@ export default function Reconciliation() {
                 <span className="spin" style={{ display: 'inline-block' }}>⚡</span>
                 LLM Batch Running
               </span>
-              <span style={{ fontSize: 12, color: 'var(--color-warning)' }}>
-                {jobStatus.done.toLocaleString()} / {jobStatus.total.toLocaleString()} invoices
-                {eta != null && ` — ~${Math.ceil(eta / 60)}m remaining`}
-              </span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <span style={{ fontSize: 12, color: 'var(--color-warning)' }}>
+                  {jobStatus.done.toLocaleString()} / {jobStatus.total.toLocaleString()} invoices
+                  {eta != null && ` — ~${Math.ceil(eta / 60)}m remaining`}
+                </span>
+                <button
+                  onClick={handleStopRematch}
+                  style={{
+                    padding: '4px 12px', borderRadius: 'var(--radius-md)',
+                    border: '1px solid var(--color-warning)', cursor: 'pointer',
+                    background: 'transparent', color: 'var(--color-warning)',
+                    fontSize: 11, fontWeight: 700,
+                  }}
+                >
+                  Stop
+                </button>
+              </div>
             </div>
             <div style={{ height: 10, background: 'rgba(0,0,0,0.1)', borderRadius: 5, overflow: 'hidden' }}>
               <div style={{

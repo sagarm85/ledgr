@@ -100,6 +100,8 @@ def get_analytics(tenant_id: str) -> AnalyticsResponse:
         for row in daily_rows
     ]
 
+    daily_payment_volumes = _get_daily_payment_volumes(tenant_id)
+
     return AnalyticsResponse(
         total_invoices=total_invoices,
         total_due=total_due,
@@ -107,8 +109,46 @@ def get_analytics(tenant_id: str) -> AnalyticsResponse:
         escalated_rate=escalated_rate,
         status_breakdown=status_breakdown,
         daily_volumes=daily_volumes,
+        daily_payment_volumes=daily_payment_volumes,
         tenant_id=tenant_id,
     )
+
+
+def _get_daily_payment_volumes(tenant_id: str, days: int = 30) -> list[dict]:
+    try:
+        from search import get_es
+        es = get_es()
+        index = f"payments-{tenant_id.lower()}"
+        if not es.indices.exists(index=index):
+            return []
+        resp = es.search(index=index, body={
+            "query": {"bool": {"must": [
+                {"term": {"tenant_id": tenant_id}},
+                {"range": {"payment_date": {"gte": f"now-{days}d/d"}}},
+            ]}},
+            "size": 0,
+            "aggs": {
+                "daily": {
+                    "date_histogram": {
+                        "field": "payment_date",
+                        "calendar_interval": "day",
+                        "order": {"_key": "asc"},
+                        "min_doc_count": 1,
+                    },
+                    "aggs": {
+                        "total_amount": {"sum": {"field": "amount_paid"}}
+                    },
+                }
+            },
+        })
+        return [
+            {"date": b["key_as_string"][:10], "count": b["doc_count"],
+             "total": round(b["total_amount"]["value"], 2)}
+            for b in resp["aggregations"]["daily"]["buckets"]
+        ]
+    except Exception as e:
+        log.error("Payment daily volumes error: %s", e)
+        return []
 
 
 CREATE_LLM_EVENTS_SQL = """
@@ -191,11 +231,11 @@ def get_llm_queue(tenant_id: str) -> LLMQueueResponse:
 
     # --- Recent completed: prefer llm_events, fall back to ESCALATED invoices ---
     recent_rows = q(
-        "SELECT invoice_id, tenant_id, toString(inserted_at), toString(inserted_at), "
-        "0 as duration_ms, 0 as candidates, status as outcome, confidence, '' as reasoning, 'done' as event_status "
+        "SELECT invoice_id, tenant_id, toString(reconciled_at), toString(reconciled_at), "
+        "0 as duration_ms, 0 as candidates, status as outcome, confidence, reasoning, 'done' as event_status "
         "FROM reconciliation.invoices_reconciled "
         "WHERE tenant_id = %(t)s AND status = 'ESCALATED' "
-        "ORDER BY inserted_at DESC LIMIT 100",
+        "ORDER BY reconciled_at DESC LIMIT 100",
         {"t": tenant_id}
     ) if not completed else q(
         "SELECT invoice_id, tenant_id, toString(started_at), toString(completed_at), "

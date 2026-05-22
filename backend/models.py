@@ -35,6 +35,7 @@ class AnalyticsResponse(BaseModel):
     escalated_rate: float
     status_breakdown: dict
     daily_volumes: List[dict]
+    daily_payment_volumes: List[dict] = []
     tenant_id: str
 
 class PaymentRecord(BaseModel):

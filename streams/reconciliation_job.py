@@ -1,5 +1,6 @@
 import os, json, logging, time
 from datetime import date
+from typing import Optional
 from kafka import KafkaConsumer, KafkaProducer
 from collections import defaultdict
 from elasticsearch import Elasticsearch
@@ -196,7 +197,7 @@ def _fuzzy_score(invoice: dict, pay: dict) -> int:
     return score
 
 
-def fuzzy_match(invoice: dict, candidates: list[dict]) -> dict | None:
+def fuzzy_match(invoice: dict, candidates: list) -> Optional[dict]:
     """
     Attempt to resolve ambiguous invoices with rule-based heuristics before
     calling the LLM. Returns a reconciled invoice dict or None if LLM is needed.
