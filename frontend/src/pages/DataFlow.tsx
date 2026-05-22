@@ -37,16 +37,34 @@ const COUNT_STAGES = new Set(['Kafka Ingest', 'Reconciled', 'Elasticsearch Sink'
 
 function enrichWithRates(next: Stage[], prev: Stage[] | null, dtSec: number): Stage[] {
   if (!prev || dtSec < 1) return next
-  return next.map(s => {
+
+  // First pass: compute rates
+  const withRates = next.map(s => {
     const p = prev.find(x => x.stage === s.stage)
     if (!p) return s
     let rate = 0
     if (LAG_STAGES.has(s.stage))   rate = Math.max(0, Math.round((p.queued - s.queued) / dtSec))
     if (COUNT_STAGES.has(s.stage)) rate = Math.max(0, Math.round((s.queued - p.queued) / dtSec))
-    const eta = rate > 0 && LAG_STAGES.has(s.stage)
-      ? Math.round(s.queued / rate / 60)   // minutes
-      : 0
-    return { ...s, rate, eta }
+    return { ...s, rate }
+  })
+
+  // Derive lag ETA — shared completion estimate for all pipeline stages
+  const lag = withRates.find(s => s.stage === 'Kafka Consumer Lag')
+  const lagEta = (lag && lag.queued > 0 && lag.rate > 0)
+    ? Math.round(lag.queued / lag.rate / 60)
+    : 0
+
+  // Second pass: assign ETAs
+  return withRates.map(s => {
+    if (LAG_STAGES.has(s.stage)) {
+      const eta = s.rate > 0 ? Math.round(s.queued / s.rate / 60) : 0
+      return { ...s, eta }
+    }
+    // Count stages share the lag ETA — they all finish when the backlog clears
+    if (COUNT_STAGES.has(s.stage) && s.stage !== 'Ollama LLM') {
+      return { ...s, eta: lagEta }
+    }
+    return s
   })
 }
 

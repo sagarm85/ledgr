@@ -168,9 +168,9 @@ def _kafka_backlog_sync() -> list:
 
     def _llm_count() -> int:
         try:
-            ch = clickhouse_driver.Client(host=CH_HOST, port=9000)
-            r  = ch.execute("SELECT count() FROM reconciliation.invoices_reconciled WHERE confidence < 0.7 AND confidence > 0")
-            return r[0][0]
+            es = Elasticsearch(ES_HOST)
+            r  = es.count(index="invoices-*", body={"query": {"term": {"status": "ESCALATED"}}})
+            return r["count"]
         except Exception:
             return 0
 
