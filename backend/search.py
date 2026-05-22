@@ -1,6 +1,6 @@
 import os, logging
 from elasticsearch import Elasticsearch, AsyncElasticsearch
-from models import InvoiceRecord, SearchResponse, PaymentRecord
+from models import InvoiceRecord, SearchResponse
 from llm.client import parse_query, QueryFilters, parse_payment_query
 
 log = logging.getLogger(__name__)
@@ -101,20 +101,31 @@ def get_payments_for_invoice(invoice_id: str, tenant_id: str) -> list[dict]:
         log.error("ES payments lookup error: %s", e)
         return []
 
-def list_invoices(tenant_id: str, page: int = 1, size: int = 50) -> SearchResponse:
+_INVOICE_SORT_FIELDS = {"amount", "invoice_date", "due_date", "confidence", "status"}
+
+def list_invoices(tenant_id: str, page: int = 1, size: int = 50,
+                  sort_by: str = "invoice_date", sort_dir: str = "desc",
+                  status: str = "") -> SearchResponse:
     """Direct ES list — no Ollama, instant response."""
+    sf = sort_by if sort_by in _INVOICE_SORT_FIELDS else "invoice_date"
+    so = "asc" if sort_dir == "asc" else "desc"
     es = get_es()
     index = f"{INDEX_PREFIX}-{tenant_id.lower()}"
-    log.info("ES list | source=elasticsearch tenant=%s page=%d size=%d", tenant_id, page, size)
+    must: list = [{"term": {"tenant_id": tenant_id}}]
+    if status:
+        must.append({"terms": {"status": status.split(",")}})
+    log.info("ES list | tenant=%s page=%d size=%d sort=%s:%s status=%s",
+             tenant_id, page, size, sf, so, status or "all")
     try:
         if not es.indices.exists(index=index):
             log.info("ES index %s does not exist — returning empty", index)
             return SearchResponse(total=0, invoices=[])
         body = {
-            "query": {"term": {"tenant_id": tenant_id}},
+            "query": {"bool": {"must": must}},
             "from": (page - 1) * size,
             "size": size,
-            "sort": [{"invoice_date": "desc"}],
+            "sort": [{sf: so}],
+            "track_total_hits": True,
         }
         resp = es.search(index=index, body=body)
         hits = resp["hits"]["hits"]
@@ -180,6 +191,7 @@ def search_invoices(query: str, tenant_id: str, page: int = 1, size: int = 50) -
         "from": (page - 1) * size,
         "size": size,
         "sort": [{"invoice_date": "desc"}],
+        "track_total_hits": True,
     }
 
     import json as _json
@@ -209,25 +221,37 @@ def search_invoices(query: str, tenant_id: str, page: int = 1, size: int = 50) -
 
 # ── Payments ──────────────────────────────────────────────────────────────────
 
-def _build_payment_body(must: list, page: int, size: int) -> dict:
+_PAYMENT_SORT_FIELDS = {"amount_paid", "payment_date", "method"}
+
+def _build_payment_body(must: list, page: int, size: int,
+                         sort_field: str = "payment_date", sort_order: str = "desc") -> dict:
     import json as _json
     body = {
         "query": {"bool": {"must": must}},
         "from": (page - 1) * size,
         "size": size,
-        "sort": [{"payment_date": "desc"}],
+        "sort": [{sort_field: sort_order}],
+        "track_total_hits": True,
     }
     log.info("ES payments query: %s", _json.dumps(body))
     return body
 
-def list_payments(tenant_id: str, page: int = 1, size: int = 100):
+def list_payments(tenant_id: str, page: int = 1, size: int = 100,
+                  sort_by: str = "payment_date", sort_dir: str = "desc",
+                  method: str = ""):
+    sf = sort_by if sort_by in _PAYMENT_SORT_FIELDS else "payment_date"
+    so = "asc" if sort_dir == "asc" else "desc"
     es = get_es()
     index = _payments_index(tenant_id)
-    log.info("ES list payments | source=elasticsearch tenant=%s page=%d size=%d", tenant_id, page, size)
+    must: list = [{"term": {"tenant_id": tenant_id}}]
+    if method:
+        must.append({"terms": {"method": method.split(",")}})
+    log.info("ES list payments | tenant=%s page=%d size=%d sort=%s:%s method=%s",
+             tenant_id, page, size, sf, so, method or "all")
     try:
         if not es.indices.exists(index=index):
             return {"total": 0, "payments": []}
-        body = _build_payment_body([{"term": {"tenant_id": tenant_id}}], page, size)
+        body = _build_payment_body(must, page, size, sf, so)
         resp = es.search(index=index, body=body)
         total = resp["hits"]["total"]["value"]
         payments = [h["_source"] for h in resp["hits"]["hits"]]

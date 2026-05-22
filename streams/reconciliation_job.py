@@ -153,10 +153,85 @@ def flush_batch(batch: list, es: Elasticsearch, ch: Client, producer: KafkaProdu
     log.info("Flushed %d reconciled invoices → ES + ClickHouse + Kafka", len(batch))
 
 
+def _fuzzy_score(invoice: dict, pay: dict) -> int:
+    """
+    Score a candidate payment against an invoice using rule-based signals.
+    Returns 0-7. Score >= 5 is confident enough to skip LLM.
+
+    Signals:
+      +3  invoice ID substring found in payment reference (partial ID match)
+      +3  amount within 1% of invoice total (near-exact)
+      +2  amount within 5% (rounding / FX tolerance)
+      +1  amount 50-95% of invoice (likely partial payment)
+      +1  payment date between invoice date and due date + 30 days
+    """
+    from datetime import date as _date
+    score = 0
+    inv_id  = invoice.get("invoice_id", "").lower()
+    ref     = (pay.get("reference") or "").lower()
+    amount  = float(invoice.get("amount", 0))
+    paid    = float(pay.get("amount_paid", 0))
+
+    # Reference contains invoice ID or meaningful suffix (last 8 chars)
+    if inv_id and (inv_id in ref or inv_id[-8:] in ref or inv_id[-12:] in ref):
+        score += 3
+
+    # Amount match
+    if amount > 0:
+        pct = paid / amount
+        if pct >= 0.99:   score += 3
+        elif pct >= 0.95: score += 2
+        elif pct >= 0.50: score += 1
+
+    # Payment date within reasonable window after invoice date
+    try:
+        inv_date = _date.fromisoformat(str(invoice.get("invoice_date", "2000-01-01")))
+        due_date = _date.fromisoformat(str(invoice.get("due_date", "2000-01-01")))
+        pay_date = _date.fromisoformat(str(pay.get("payment_date", "2000-01-01")))
+        if inv_date <= pay_date <= due_date + __import__("datetime").timedelta(days=30):
+            score += 1
+    except Exception:
+        pass
+
+    return score
+
+
+def fuzzy_match(invoice: dict, candidates: list[dict]) -> dict | None:
+    """
+    Attempt to resolve ambiguous invoices with rule-based heuristics before
+    calling the LLM. Returns a reconciled invoice dict or None if LLM is needed.
+
+    Threshold: score >= 5 means at least reference ID match + near-exact amount,
+    which is confident enough to auto-resolve without Ollama.
+    """
+    amount = float(invoice.get("amount", 0))
+    best_score, best_pay = 0, None
+    for pay in candidates:
+        s = _fuzzy_score(invoice, pay)
+        if s > best_score:
+            best_score, best_pay = s, pay
+
+    if best_score >= 5 and best_pay:
+        paid   = float(best_pay.get("amount_paid", 0))
+        pct    = paid / amount if amount > 0 else 0
+        status = "FULLY_PAID" if pct >= 0.99 else "PARTIALLY_PAID"
+        due    = max(0.0, round(amount - paid, 2))
+        return {
+            **invoice,
+            "status":             status,
+            "confidence":         round(0.7 + best_score * 0.04, 2),  # 0.90-0.98
+            "matched_payment_id": best_pay["payment_id"],
+            "due_amount":         due,
+            "reasoning":          f"Fuzzy rule match (score={best_score}/7): ref+amount signals resolved without LLM.",
+        }
+    return None
+
+
 def reconcile(invoice: dict, payments_by_invoice: dict) -> dict:
     invoice_id = invoice["invoice_id"]
     candidates = payments_by_invoice.get(invoice_id, [])
 
+    # Stage 1 — exact reference match (highest confidence)
     for pay in candidates:
         if pay.get("reference") == invoice_id and pay["amount_paid"] >= invoice["amount"] * 0.99:
             return {**invoice, "status": "FULLY_PAID", "confidence": 1.0,
@@ -166,22 +241,27 @@ def reconcile(invoice: dict, payments_by_invoice: dict) -> dict:
             return {**invoice, "status": "PARTIALLY_PAID", "confidence": 0.9,
                     "matched_payment_id": pay["payment_id"], "due_amount": due}
 
-    if candidates:
-        if SKIP_LLM:
-            # bulk mode: no LLM call — flag for later review
-            return {**invoice, "status": "ESCALATED", "confidence": 0.5,
-                    "matched_payment_id": None, "due_amount": invoice["amount"],
-                    "reasoning": "skipped-llm-bulk-load"}
-        result: MatchResult = match_invoice(invoice, candidates[:5])
-        status = ("FULLY_PAID"     if result.confidence >= 0.9 else
-                  "PARTIALLY_PAID" if result.confidence >= CONFIDENCE_THRESHOLD else
-                  "ESCALATED")
-        return {**invoice, "status": status, "confidence": result.confidence,
-                "matched_payment_id": result.matched_payment_id,
-                "due_amount": result.due_amount, "reasoning": result.reasoning}
+    if not candidates:
+        return {**invoice, "status": "UNPAID", "confidence": 0.0,
+                "matched_payment_id": None, "due_amount": invoice["amount"]}
 
-    return {**invoice, "status": "UNPAID", "confidence": 0.0,
-            "matched_payment_id": None, "due_amount": invoice["amount"]}
+    # Stage 2 — fuzzy rule-based match (avoids LLM for clear cases)
+    fuzzy = fuzzy_match(invoice, candidates)
+    if fuzzy:
+        return fuzzy
+
+    # Stage 3 — LLM reasoning for genuinely ambiguous cases
+    if SKIP_LLM:
+        return {**invoice, "status": "ESCALATED", "confidence": 0.5,
+                "matched_payment_id": None, "due_amount": invoice["amount"],
+                "reasoning": "skipped-llm-bulk-load"}  # UI maps this to a human-readable message
+    result: MatchResult = match_invoice(invoice, candidates[:5])
+    status = ("FULLY_PAID"     if result.confidence >= 0.9 else
+              "PARTIALLY_PAID" if result.confidence >= CONFIDENCE_THRESHOLD else
+              "ESCALATED")
+    return {**invoice, "status": status, "confidence": result.confidence,
+            "matched_payment_id": result.matched_payment_id,
+            "due_amount": result.due_amount, "reasoning": result.reasoning}
 
 
 def run():

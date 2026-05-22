@@ -23,10 +23,10 @@ export default function Sidebar() {
       flexShrink: 0,
     }}>
       <div style={{ padding: 'var(--space-md)', marginBottom: 'var(--space-sm)' }}>
-        <p style={{ fontSize: 16, fontWeight: 700, color: 'var(--color-primary)' }}>
+        <p style={{ fontSize: 26, fontWeight: 800, color: 'var(--color-primary)', lineHeight: 1.2 }}>
           📊 Ledgr
         </p>
-        <p style={{ fontSize: 11, color: 'var(--color-text-3)', marginTop: 2 }}>
+        <p style={{ fontSize: 11, color: 'var(--color-text-3)', marginTop: 4 }}>
           Ollama · Local · Free
         </p>
       </div>

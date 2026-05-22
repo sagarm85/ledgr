@@ -1,5 +1,3 @@
-// src/components/InvoiceTable.tsx
-
 import StatusBadge from './StatusBadge'
 import ConfidenceBar from './ConfidenceBar'
 import { InvoiceRecord } from '../api'
@@ -8,11 +6,25 @@ interface InvoiceTableProps {
   invoices?: InvoiceRecord[]
   loading?: boolean
   onRowClick?: (inv: InvoiceRecord) => void
+  sortBy?: string
+  sortDir?: 'asc' | 'desc'
+  onSort?: (field: string) => void
 }
 
-const COLS = ['Invoice ID', 'Tenant', 'Customer', 'Amount', 'Invoice Date', 'Due Date', 'Status', 'Confidence']
+const COLS: { label: string; field: string | null }[] = [
+  { label: 'Invoice ID',   field: null },
+  { label: 'Customer',     field: null },
+  { label: 'Amount',       field: 'amount' },
+  { label: 'Invoice Date', field: 'invoice_date' },
+  { label: 'Due Date',     field: 'due_date' },
+  { label: 'Status',       field: 'status' },
+  { label: 'Confidence',   field: 'confidence' },
+]
 
-export default function InvoiceTable({ invoices = [], loading = false, onRowClick }: InvoiceTableProps) {
+export default function InvoiceTable({
+  invoices = [], loading = false, onRowClick,
+  sortBy, sortDir, onSort,
+}: InvoiceTableProps) {
   if (loading) return <Skeleton />
   if (!invoices.length) return <Empty />
 
@@ -27,15 +39,30 @@ export default function InvoiceTable({ invoices = [], loading = false, onRowClic
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ borderBottom: '2px solid var(--color-border)' }}>
-              {COLS.map(h => (
-                <th key={h} style={{
-                  padding: '12px 16px', textAlign: 'left',
-                  fontSize: 11, fontWeight: 600,
-                  color: 'var(--color-text-3)',
-                  textTransform: 'uppercase', letterSpacing: '0.5px',
-                  whiteSpace: 'nowrap',
-                }}>{h}</th>
-              ))}
+              {COLS.map(({ label, field }) => {
+                const active = field && sortBy === field
+                const sortable = !!field && !!onSort
+                return (
+                  <th key={label}
+                    onClick={sortable ? () => onSort!(field!) : undefined}
+                    style={{
+                      padding: '12px 16px', textAlign: 'left',
+                      fontSize: 11, fontWeight: 600,
+                      color: active ? 'var(--color-primary)' : 'var(--color-text-3)',
+                      textTransform: 'uppercase', letterSpacing: '0.5px',
+                      whiteSpace: 'nowrap',
+                      cursor: sortable ? 'pointer' : 'default',
+                      userSelect: 'none',
+                    }}>
+                    {label}
+                    {sortable && (
+                      <span style={{ marginLeft: 4, opacity: active ? 1 : 0.3 }}>
+                        {active ? (sortDir === 'asc' ? '↑' : '↓') : '↕'}
+                      </span>
+                    )}
+                  </th>
+                )
+              })}
             </tr>
           </thead>
           <tbody>
@@ -53,7 +80,6 @@ export default function InvoiceTable({ invoices = [], loading = false, onRowClic
                 onMouseLeave={e => { (e.currentTarget as HTMLTableRowElement).style.background = i % 2 === 0 ? 'var(--color-surface)' : '#FAFBFC' }}
               >
                 <td style={{ padding: '12px 16px', fontFamily: 'var(--font-mono)', fontSize: 12 }}>{inv.invoice_id}</td>
-                <td style={{ padding: '12px 16px', fontSize: 13 }}>{inv.tenant_id}</td>
                 <td style={{ padding: '12px 16px', fontSize: 13 }}>{inv.customer}</td>
                 <td style={{ padding: '12px 16px', fontSize: 14, fontWeight: 600 }}>
                   ${Number(inv.amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}

@@ -6,7 +6,7 @@ from jose import jwt, JWTError
 from models import (SearchRequest, SearchResponse, AnalyticsResponse, GenerateRequest, HealthResponse,
                     LLMQueueResponse, ReconciliationResponse, ReconciliationRecord,
                     PaymentRecord, ManualReconcileRequest, ManualReconcileResponse)
-from search import search_invoices, list_invoices, get_payments_for_invoice, index_payment, list_payments, search_payments
+from search import search_invoices, list_invoices, get_payments_for_invoice, list_payments, search_payments
 from analytics import get_analytics, get_llm_queue
 import httpx
 
@@ -14,6 +14,8 @@ _kafka_executor = ThreadPoolExecutor(max_workers=1)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger(__name__)
+
+_rematch_job: dict = {"running": False, "total": 0, "done": 0, "tenant_id": None, "started_at": None}
 
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-in-production")
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
@@ -87,9 +89,12 @@ async def health():
 async def invoices(
     page: int = 1,
     size: int = 50,
+    sort_by: str = "invoice_date",
+    sort_dir: str = "desc",
+    status: str = "",
     tenant_id: str = Depends(get_tenant),
 ):
-    return list_invoices(tenant_id, page, size)
+    return list_invoices(tenant_id, page, size, sort_by, sort_dir, status)
 
 @app.post("/api/invoices/search", response_model=SearchResponse)
 async def search(req: SearchRequest, tenant_id: str = Depends(get_tenant)):
@@ -254,9 +259,12 @@ async def reconciliation(
 async def payments_list(
     page: int = 1,
     size: int = 100,
+    sort_by: str = "payment_date",
+    sort_dir: str = "desc",
+    method: str = "",
     tenant_id: str = Depends(get_tenant),
 ):
-    return list_payments(tenant_id, page, size)
+    return list_payments(tenant_id, page, size, sort_by, sort_dir, method)
 
 @app.post("/api/payments/search", response_model=dict)
 async def payments_search(
@@ -313,8 +321,293 @@ async def manual_reconcile(req: ManualReconcileRequest, tenant_id: str = Depends
 
     return ManualReconcileResponse(invoice_id=req.invoice_id, payment_id=req.payment_id, status=req.status, updated=True)
 
+def _rematch_one(inv: dict, tenant_id: str, index: str, confidence_threshold: float):
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    from llm.client import match_invoice
+    from search import get_es
+    from analytics import get_client as ch_client
+
+    invoice_id = inv.get("invoice_id", "")
+    try:
+        candidates = get_payments_for_invoice(invoice_id, tenant_id)
+        if not candidates:
+            return
+
+        # Stage 1: fuzzy rule-based match — avoids Ollama for clear cases
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from streams.reconciliation_job import fuzzy_match
+        fuzzy = fuzzy_match(inv, candidates)
+        if fuzzy:
+            update_doc = {
+                "status": fuzzy["status"], "confidence": fuzzy["confidence"],
+                "matched_payment_id": fuzzy["matched_payment_id"],
+                "due_amount": fuzzy["due_amount"], "reasoning": fuzzy["reasoning"],
+            }
+            matched = next((p for p in candidates if p["payment_id"] == fuzzy["matched_payment_id"]), None)
+            if matched:
+                update_doc["payment_amount_paid"] = matched.get("amount_paid")
+                update_doc["payment_date"]        = matched.get("payment_date")
+                update_doc["payment_method"]      = matched.get("method")
+            get_es().update(index=index, id=invoice_id, body={"doc": update_doc})
+            try:
+                ch_client().execute(
+                    "ALTER TABLE reconciliation.invoices_reconciled UPDATE "
+                    "status=%(s)s, confidence=%(c)s, matched_payment_id=%(p)s, due_amount=%(d)s "
+                    "WHERE invoice_id=%(i)s AND tenant_id=%(t)s",
+                    {"s": fuzzy["status"], "c": fuzzy["confidence"],
+                     "p": fuzzy["matched_payment_id"] or "", "d": fuzzy["due_amount"],
+                     "i": invoice_id, "t": tenant_id},
+                )
+            except Exception as e:
+                log.warning("CH fuzzy update failed %s: %s", invoice_id, e)
+            log.info("Rematch fuzzy | %s → %s (score conf=%.2f)", invoice_id, fuzzy["status"], fuzzy["confidence"])
+            return
+
+        # Stage 2: LLM for genuinely ambiguous cases
+        import time as _t
+        from datetime import datetime as _dt
+        _started_at = _dt.utcnow()
+        _t0 = _t.time()
+        result = match_invoice(inv, candidates[:5])
+        _duration_ms = round((_t.time() - _t0) * 1000)
+        _completed_at = _dt.utcnow()
+
+        status = (
+            "FULLY_PAID"     if result.confidence >= 0.9 else
+            "PARTIALLY_PAID" if result.confidence >= confidence_threshold else
+            "ESCALATED"
+        )
+        update_doc = {
+            "status": status, "confidence": result.confidence,
+            "matched_payment_id": result.matched_payment_id,
+            "due_amount": result.due_amount, "reasoning": result.reasoning,
+        }
+        if result.matched_payment_id:
+            matched = next((p for p in candidates if p["payment_id"] == result.matched_payment_id), None)
+            if matched:
+                update_doc["payment_amount_paid"] = matched.get("amount_paid")
+                update_doc["payment_date"]        = matched.get("payment_date")
+                update_doc["payment_method"]      = matched.get("method")
+        get_es().update(index=index, id=invoice_id, body={"doc": update_doc})
+        try:
+            ch_client().execute(
+                "ALTER TABLE reconciliation.invoices_reconciled UPDATE "
+                "status=%(s)s, confidence=%(c)s, matched_payment_id=%(p)s, due_amount=%(d)s "
+                "WHERE invoice_id=%(i)s AND tenant_id=%(t)s",
+                {"s": status, "c": result.confidence,
+                 "p": result.matched_payment_id or "", "d": result.due_amount,
+                 "i": invoice_id, "t": tenant_id},
+            )
+        except Exception as e:
+            log.warning("CH rematch update failed %s: %s", invoice_id, e)
+
+        try:
+            from analytics import insert_llm_event
+            insert_llm_event({
+                "invoice_id":   invoice_id,
+                "tenant_id":    tenant_id,
+                "started_at":   _started_at,
+                "completed_at": _completed_at,
+                "duration_ms":  _duration_ms,
+                "candidates":   len(candidates[:5]),
+                "outcome":      status,
+                "confidence":   result.confidence,
+                "reasoning":    result.reasoning,
+                "status":       "done",
+            })
+        except Exception as e:
+            log.warning("llm_event insert failed %s: %s", invoice_id, e)
+
+        log.info("Rematch LLM | %s → %s (conf=%.2f)", invoice_id, status, result.confidence)
+    except Exception as e:
+        log.warning("Rematch failed %s: %s", invoice_id, e)
+
+
+async def _rematch_all_async(tenant_id: str):
+    import sys, time as _time
+    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    from search import get_es
+
+    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.75"))
+    DELAY_S = float(os.getenv("REMATCH_DELAY_S", "1.0"))
+    index = f"invoices-{tenant_id.lower()}"
+
+    def _fetch_batch(search_after: list | None):
+        body: dict = {
+            "query": {"bool": {"must": [
+                {"term": {"tenant_id": tenant_id}},
+                {"term": {"status": "ESCALATED"}},
+            ]}},
+            "size": 500,
+            "sort": [{"invoice_id": "asc"}],
+        }
+        if search_after:
+            body["search_after"] = search_after
+        return get_es().search(index=index, body=body)
+
+    all_invoices = []
+    search_after = None
+    while True:
+        try:
+            resp = await asyncio.to_thread(_fetch_batch, search_after)
+        except Exception as e:
+            log.error("Batch rematch fetch failed: %s", e)
+            break
+        hits = resp["hits"]["hits"]
+        if not hits:
+            break
+        all_invoices.extend(h["_source"] for h in hits)
+        search_after = hits[-1]["sort"]
+
+    _rematch_job.update({"running": True, "total": len(all_invoices), "done": 0,
+                         "tenant_id": tenant_id, "started_at": _time.time()})
+    log.info("Batch rematch started: %d ESCALATED invoices", len(all_invoices))
+
+    try:
+        for inv in all_invoices:
+            await asyncio.to_thread(_rematch_one, inv, tenant_id, index, CONFIDENCE_THRESHOLD)
+            _rematch_job["done"] += 1
+            if _rematch_job["done"] % 10 == 0:
+                log.info("Batch rematch progress: %d/%d", _rematch_job["done"], len(all_invoices))
+            await asyncio.sleep(DELAY_S)
+    finally:
+        _rematch_job["running"] = False
+        log.info("Batch rematch complete: %d/%d processed", _rematch_job["done"], len(all_invoices))
+
+
+@app.get("/api/reconciliation/rematch-status")
+async def rematch_status():
+    import time as _time
+    job = _rematch_job
+    elapsed = round(_time.time() - job["started_at"], 0) if job["running"] and job["started_at"] else None
+    rate = round(job["done"] / elapsed, 2) if elapsed and job["done"] else None
+    eta_s = round((job["total"] - job["done"]) / rate, 0) if rate and job["total"] > job["done"] else None
+    return {
+        "running":    job["running"],
+        "total":      job["total"],
+        "done":       job["done"],
+        "remaining":  max(0, job["total"] - job["done"]),
+        "elapsed_s":  elapsed,
+        "rate_per_s": rate,
+        "eta_s":      eta_s,
+    }
+
+@app.post("/api/reconciliation/rematch-skipped")
+async def rematch_skipped(tenant_id: str = Depends(get_tenant)):
+    if _rematch_job["running"]:
+        return {
+            "status": "already_running",
+            "queued": _rematch_job["total"],
+            "done":   _rematch_job["done"],
+        }
+
+    from search import get_es
+    es = get_es()
+    index = f"invoices-{tenant_id.lower()}"
+    try:
+        count_res = await asyncio.to_thread(
+            lambda: es.count(index=index, body={"query": {"bool": {"must": [
+                {"term": {"tenant_id": tenant_id}},
+                {"term": {"status": "ESCALATED"}},
+            ]}}})
+        )
+        count = count_res["count"]
+    except Exception:
+        count = 0
+
+    if count == 0:
+        return {"queued": 0, "status": "nothing_to_process"}
+
+    asyncio.create_task(_rematch_all_async(tenant_id))
+    return {"queued": count, "status": "started"}
+
+@app.post("/api/reconciliation/{invoice_id}/rematch", response_model=ReconciliationRecord)
+async def rematch_invoice(invoice_id: str, tenant_id: str = Depends(get_tenant)):
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    from llm.client import match_invoice
+    from search import get_es
+    from analytics import get_client as ch_client
+
+    es = get_es()
+    inv_index = f"invoices-{tenant_id.lower()}"
+
+    # Fetch the invoice from ES
+    try:
+        doc = es.get(index=inv_index, id=invoice_id)
+        inv = doc["_source"]
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Invoice not found: {e}")
+
+    # Fetch candidate payments
+    candidates = get_payments_for_invoice(invoice_id, tenant_id)
+    if not candidates:
+        raise HTTPException(status_code=422, detail="No candidate payments found — cannot run LLM match")
+
+    # Call Ollama
+    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.75"))
+    try:
+        result = match_invoice(inv, candidates[:5])
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Ollama unavailable: {e}")
+
+    status = (
+        "FULLY_PAID"     if result.confidence >= 0.9           else
+        "PARTIALLY_PAID" if result.confidence >= CONFIDENCE_THRESHOLD else
+        "ESCALATED"
+    )
+    update_doc = {
+        "status":             status,
+        "confidence":         result.confidence,
+        "matched_payment_id": result.matched_payment_id,
+        "due_amount":         result.due_amount,
+        "reasoning":          result.reasoning,
+    }
+    if result.matched_payment_id:
+        matched = next((p for p in candidates if p["payment_id"] == result.matched_payment_id), None)
+        if matched:
+            update_doc["payment_amount_paid"] = matched.get("amount_paid")
+            update_doc["payment_date"]        = matched.get("payment_date")
+            update_doc["payment_method"]      = matched.get("method")
+
+    es.update(index=inv_index, id=invoice_id, body={"doc": update_doc}, refresh="wait_for")
+
+    try:
+        ch = ch_client()
+        ch.execute(
+            "ALTER TABLE reconciliation.invoices_reconciled UPDATE "
+            "status=%(s)s, confidence=%(c)s, matched_payment_id=%(p)s, due_amount=%(d)s "
+            "WHERE invoice_id=%(i)s AND tenant_id=%(t)s",
+            {"s": status, "c": result.confidence,
+             "p": result.matched_payment_id or "", "d": result.due_amount,
+             "i": invoice_id, "t": tenant_id},
+        )
+    except Exception as e:
+        log.warning("ClickHouse rematch update failed: %s", e)
+
+    src = {**inv, **update_doc}
+    return ReconciliationRecord(
+        invoice_id=src.get("invoice_id", ""),
+        tenant_id=src.get("tenant_id", ""),
+        merchant=src.get("merchant", ""),
+        customer=src.get("customer", ""),
+        amount=float(src.get("amount", 0)),
+        invoice_date=src.get("invoice_date", ""),
+        due_date=src.get("due_date", ""),
+        status=status,
+        confidence=result.confidence,
+        matched_payment_id=result.matched_payment_id,
+        due_amount=result.due_amount,
+        reasoning=result.reasoning,
+        payment_amount_paid=src.get("payment_amount_paid"),
+        payment_date=src.get("payment_date"),
+        payment_method=src.get("payment_method"),
+    )
+
 @app.post("/api/generate")
-async def generate(req: GenerateRequest, tenant_id: str = Depends(get_tenant)):
+async def generate(req: GenerateRequest):
     cmd = [
         "python", "job/generate.py",
         "--tenant-id", req.tenant_id,

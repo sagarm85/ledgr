@@ -191,11 +191,11 @@ def get_llm_queue(tenant_id: str) -> LLMQueueResponse:
 
     # --- Recent completed: prefer llm_events, fall back to ESCALATED invoices ---
     recent_rows = q(
-        "SELECT invoice_id, tenant_id, toString(reconciled_at), toString(reconciled_at), "
-        "0 as duration_ms, 0 as candidates, status as outcome, confidence, reasoning, 'done' as event_status "
+        "SELECT invoice_id, tenant_id, toString(inserted_at), toString(inserted_at), "
+        "0 as duration_ms, 0 as candidates, status as outcome, confidence, '' as reasoning, 'done' as event_status "
         "FROM reconciliation.invoices_reconciled "
         "WHERE tenant_id = %(t)s AND status = 'ESCALATED' "
-        "ORDER BY reconciled_at DESC LIMIT 100",
+        "ORDER BY inserted_at DESC LIMIT 100",
         {"t": tenant_id}
     ) if not completed else q(
         "SELECT invoice_id, tenant_id, toString(started_at), toString(completed_at), "
@@ -204,9 +204,6 @@ def get_llm_queue(tenant_id: str) -> LLMQueueResponse:
         "ORDER BY completed_at DESC LIMIT 100",
         {"t": tenant_id}
     )
-
-    # completed count = llm_events done OR total escalated (whichever is larger)
-    completed = max(completed, escalated)
 
     def to_event(row) -> LLMEvent:
         return LLMEvent(

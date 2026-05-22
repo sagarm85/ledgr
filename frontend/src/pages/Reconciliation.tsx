@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import axios from 'axios'
 import PageHeader from '../components/PageHeader'
@@ -272,6 +272,10 @@ export default function Reconciliation() {
   const [modal, setModal] = useState<MatchModal | null>(null)
   const [saving, setSaving] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
+  const [rematching, setRematching] = useState(false)
+  const [jobStatus, setJobStatus] = useState<{ running: boolean; total: number; done: number; eta_s: number | null } | null>(null)
+  const [statusLoading, setStatusLoading] = useState(true)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const loadRecords = useCallback(async (status: string, p: number) => {
     setLoading(true)
@@ -348,6 +352,72 @@ export default function Reconciliation() {
     }
   }
 
+  const handleRematch = async () => {
+    if (!selected) return
+    setRematching(true)
+    try {
+      const res = await axios.post<ReconciliationRecord>(`/api/reconciliation/${selected.invoice_id}/rematch`)
+      const updated = res.data
+      setSelected(updated)
+      setRecords(prev => prev.map(r => r.invoice_id === updated.invoice_id ? updated : r))
+      if (updated.status === 'ESCALATED') {
+        showToast('LLM could not resolve — still ESCALATED. Review candidates manually.')
+      } else {
+        showToast(`LLM resolved: ${updated.invoice_id} → ${updated.status.replace('_', ' ')} (confidence ${(updated.confidence * 100).toFixed(0)}%)`)
+        await loadStatusCounts()
+      }
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'LLM rematch failed'
+      showToast(msg)
+    } finally {
+      setRematching(false)
+    }
+  }
+
+  const startPolling = useCallback(() => {
+    if (pollRef.current) return
+    pollRef.current = setInterval(async () => {
+      try {
+        const res = await axios.get<{ running: boolean; total: number; done: number; eta_s: number | null }>('/api/reconciliation/rematch-status')
+        setJobStatus(res.data)
+        if (!res.data.running) {
+          clearInterval(pollRef.current!)
+          pollRef.current = null
+          await loadStatusCounts()
+          await loadRecords(statusFilter, page)
+        }
+      } catch { /* non-critical */ }
+    }, 2000)
+  }, [loadStatusCounts, loadRecords, statusFilter, page])
+
+  useEffect(() => {
+    axios.get<{ running: boolean; total: number; done: number; eta_s: number | null }>('/api/reconciliation/rematch-status')
+      .then(res => {
+        setJobStatus(res.data)
+        if (res.data.running) startPolling()
+      })
+      .catch(() => {})
+      .finally(() => setStatusLoading(false))
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+  }, [])
+
+  const handleRematchAll = async () => {
+    try {
+      const res = await axios.post<{ queued: number; done?: number; status: string }>('/api/reconciliation/rematch-skipped')
+      if (res.data.status === 'already_running') {
+        showToast(`Job already running — ${res.data.done ?? 0}/${res.data.queued} done. Watch progress in the button.`)
+        startPolling()
+      } else if (res.data.status === 'nothing_to_process') {
+        showToast('No ESCALATED records to process.')
+      } else {
+        showToast(`LLM batch started on ${res.data.queued.toLocaleString()} invoices. Progress shown in the button.`)
+        startPolling()
+      }
+    } catch {
+      showToast('Batch LLM rematch failed — check backend logs.')
+    }
+  }
+
   const showToast = (msg: string) => {
     setToast(msg)
     setTimeout(() => setToast(null), 4000)
@@ -362,12 +432,29 @@ export default function Reconciliation() {
       <PageHeader
         title="Reconciliation"
         action={
-          <span style={{ fontSize: 13, color: 'var(--color-text-2)' }}>
-            {Object.keys(statusCounts).length > 0
-              ? Object.values(statusCounts).reduce((a, b) => a + b, 0).toLocaleString()
-              : total.toLocaleString()
-            } total records
-          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            {!statusLoading && (statusCounts['ESCALATED'] ?? 0) > 0 && !jobStatus?.running && (
+              <button
+                onClick={handleRematchAll}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  padding: '6px 14px', borderRadius: 'var(--radius-md)',
+                  border: 'none', cursor: 'pointer',
+                  background: 'var(--color-warning)', color: '#fff',
+                  fontSize: 12, fontWeight: 700,
+                }}
+              >
+                <span style={{ fontSize: 13 }}>⚡</span>
+                Run LLM on All Skipped ({(statusCounts['ESCALATED'] ?? 0).toLocaleString()})
+              </button>
+            )}
+            <span style={{ fontSize: 13, color: 'var(--color-text-2)' }}>
+              {Object.keys(statusCounts).length > 0
+                ? Object.values(statusCounts).reduce((a, b) => a + b, 0).toLocaleString()
+                : total.toLocaleString()
+              } total records
+            </span>
+          </div>
         }
       />
 
@@ -401,6 +488,43 @@ export default function Reconciliation() {
           )
         })}
       </div>
+
+      {/* LLM batch progress banner */}
+      {jobStatus?.running && (() => {
+        const pct = jobStatus.total > 0 ? Math.round((jobStatus.done / jobStatus.total) * 100) : 0
+        const eta = jobStatus.eta_s
+        return (
+          <div style={{
+            marginBottom: 'var(--space-md)',
+            background: 'var(--color-warning-light)',
+            border: '1px solid var(--color-warning)',
+            borderRadius: 'var(--radius-md)',
+            padding: '12px 16px',
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--color-warning)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span className="spin" style={{ display: 'inline-block' }}>⚡</span>
+                LLM Batch Running
+              </span>
+              <span style={{ fontSize: 12, color: 'var(--color-warning)' }}>
+                {jobStatus.done.toLocaleString()} / {jobStatus.total.toLocaleString()} invoices
+                {eta != null && ` — ~${Math.ceil(eta / 60)}m remaining`}
+              </span>
+            </div>
+            <div style={{ height: 10, background: 'rgba(0,0,0,0.1)', borderRadius: 5, overflow: 'hidden' }}>
+              <div style={{
+                height: '100%', borderRadius: 5,
+                background: 'var(--color-warning)',
+                width: `${pct}%`,
+                transition: 'width 0.5s ease',
+              }} />
+            </div>
+            <div style={{ textAlign: 'right', fontSize: 11, color: 'var(--color-warning)', marginTop: 4 }}>
+              {pct}% complete
+            </div>
+          </div>
+        )
+      })()}
 
       {/* Split pane */}
       <div style={{ display: 'grid', gridTemplateColumns: '360px 1fr', gap: 'var(--space-md)', alignItems: 'start' }}>
@@ -464,8 +588,37 @@ export default function Reconciliation() {
                 title={`Candidate Payments from Store (${candidates.length})`}
                 accent="var(--color-warning)"
               >
+                {selected.reasoning === 'skipped-llm-bulk-load' && (
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: 10,
+                    marginBottom: 12, padding: '10px 12px',
+                    background: 'var(--color-warning-light)', borderRadius: 'var(--radius-md)',
+                    border: '1px solid var(--color-warning)',
+                  }}>
+                    <span style={{ fontSize: 12, color: 'var(--color-warning)', flex: 1 }}>
+                      LLM was skipped during bulk load. Run it now to auto-resolve, or match manually below.
+                    </span>
+                    <button
+                      onClick={handleRematch}
+                      disabled={rematching}
+                      style={{
+                        padding: '6px 14px', borderRadius: 'var(--radius-md)',
+                        border: 'none', cursor: rematching ? 'not-allowed' : 'pointer',
+                        background: rematching ? 'var(--color-border)' : 'var(--color-warning)',
+                        color: rematching ? 'var(--color-text-3)' : '#fff',
+                        fontSize: 12, fontWeight: 700, whiteSpace: 'nowrap',
+                        display: 'flex', alignItems: 'center', gap: 6,
+                      }}
+                    >
+                      <span className={rematching ? 'spin' : ''} style={{ fontSize: 13 }}>⚡</span>
+                      {rematching ? 'Running LLM…' : 'Run LLM Match'}
+                    </button>
+                  </div>
+                )}
                 <p style={{ fontSize: 12, color: 'var(--color-text-3)', marginBottom: 12 }}>
-                  Ollama confidence was too low to auto-match. Review the candidates below and reconcile manually.
+                  {selected.reasoning === 'skipped-llm-bulk-load'
+                    ? 'Or select a candidate payment below to reconcile manually.'
+                    : 'Ollama confidence was too low to auto-match. Review the candidates below and reconcile manually.'}
                 </p>
                 <CandidatePayments
                   invoice={selected}
@@ -539,12 +692,15 @@ export default function Reconciliation() {
                     Reasoning
                   </p>
                   <p style={{
-                    fontSize: 13, color: 'var(--color-text-2)',
+                    fontSize: 13, color: selected.reasoning === 'skipped-llm-bulk-load' ? 'var(--color-warning)' : 'var(--color-text-2)',
                     background: 'var(--color-bg)', borderRadius: 'var(--radius-md)',
                     padding: 'var(--space-sm) var(--space-md)',
-                    lineHeight: 1.6, borderLeft: '3px solid var(--color-primary)',
+                    lineHeight: 1.6,
+                    borderLeft: `3px solid ${selected.reasoning === 'skipped-llm-bulk-load' ? 'var(--color-warning)' : 'var(--color-primary)'}`,
                   }}>
-                    {selected.reasoning}
+                    {selected.reasoning === 'skipped-llm-bulk-load'
+                      ? 'LLM matching was skipped during bulk data load. Candidate payments exist but could not be auto-matched — please review manually.'
+                      : selected.reasoning}
                   </p>
                 </div>
               )}

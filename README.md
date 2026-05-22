@@ -57,6 +57,84 @@
 
 ---
 
+## Reconciliation Engine
+
+The engine resolves invoices to payments in three stages — each only runs if the previous stage could not resolve the invoice.
+
+```
+Invoice + Candidate Payments
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│ Stage 1: Exact Reference Match          │  ~20-40% of invoices resolved
+│                                         │  Confidence: 1.0
+│  reference == invoice_id                │
+│  AND amount_paid >= invoice.amount*0.99 │ → FULLY_PAID
+│  OR  amount_paid >= invoice.amount*0.50 │ → PARTIALLY_PAID
+└──────────────────┬──────────────────────┘
+                   │ No exact match
+                   ▼
+┌─────────────────────────────────────────┐
+│ Stage 2: Fuzzy Rule Match               │  ~60-80% of remaining resolved
+│                                         │  Confidence: 0.90-0.98
+│  Scoring system (7 points max):         │
+│    +3  invoice_id in payment reference  │
+│    +3  amount within 1% (near-exact)    │
+│    +2  amount within 5%                 │
+│    +1  amount 50-95% (partial)          │
+│    +1  payment within due date window   │
+│                                         │
+│  Score ≥ 5 → auto-resolve               │
+│  Score < 5 → send to LLM               │
+└──────────────────┬──────────────────────┘
+                   │ Score < 5
+                   ▼
+┌─────────────────────────────────────────┐
+│ Stage 3: Ollama LLM                     │  Remaining ~5-20%
+│                                         │
+│  SKIP_LLM=true  → ESCALATED instantly  │
+│  SKIP_LLM=false → Ollama reasoning:    │
+│    conf ≥ 0.90  → FULLY_PAID           │
+│    conf ≥ 0.75  → PARTIALLY_PAID       │
+│    conf < 0.75  → ESCALATED            │
+└─────────────────────────────────────────┘
+```
+
+### Record Lifecycle
+
+```
+Invoice created (UNPAID)
+    │
+    ├─ Exact reference match found         → FULLY_PAID or PARTIALLY_PAID
+    │
+    ├─ Fuzzy rule match (score ≥ 5/7)      → FULLY_PAID or PARTIALLY_PAID
+    │
+    ├─ Ambiguous candidates exist
+    │     ├─ SKIP_LLM=false               → Ollama decides
+    │     │     ├─ confidence ≥ 0.9       → FULLY_PAID
+    │     │     ├─ confidence ≥ 0.75      → PARTIALLY_PAID
+    │     │     └─ confidence < 0.75      → ESCALATED
+    │     │
+    │     └─ SKIP_LLM=true               → ESCALATED (batch rematch later)
+    │
+    └─ No candidates at all               → UNPAID
+```
+
+After bulk load, resolve ESCALATED records from the **Reconciliation** page: click **⚡ Run LLM on All Skipped** to process them in the background, or open any ESCALATED invoice and click **Match as Fully Paid** / **Match as Partially Paid** for manual override.
+
+### Tenant Isolation
+
+Every record at every layer carries `tenant_id`. Queries always filter on `tenant_id` first.
+
+| Layer | Isolation mechanism |
+|-------|-------------------|
+| Kafka | `tenant_id` field in every message |
+| Elasticsearch | Index per tenant: `invoices-{tenant_id.lower()}` |
+| ClickHouse | `WHERE tenant_id = ?` on every query |
+| FastAPI | JWT decoded on every request; defaults to `DEMO` in dev |
+
+---
+
 ## Stack
 
 | Layer | Technology |
@@ -397,6 +475,17 @@ API_PORT=8000
 JWT_SECRET=change-this-in-production
 LOG_LEVEL=INFO
 ```
+
+### Key Runtime Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OLLAMA_MODEL` | `mistral` | LLM model — swap without code changes |
+| `SKIP_LLM` | `false` | Skip Ollama during bulk load; marks ambiguous as ESCALATED |
+| `CONFIDENCE_THRESHOLD` | `0.75` | Minimum Ollama confidence for PARTIALLY_PAID |
+| `REMATCH_DELAY_S` | `1.0` | Delay between LLM calls during batch rematch (prevents CPU saturation) |
+| `DEMO_SLEEP_MS` | `0` | Slow down reconciliation job for demo visibility |
+| `RECONCILE_BATCH_SIZE` | `500` | Records to flush per batch in reconciliation job |
 
 ---
 
